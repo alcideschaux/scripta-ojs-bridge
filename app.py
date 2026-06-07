@@ -210,3 +210,23 @@ async def get_user(
 ):
     check_auth(authorization)
     return await call_ojs(f"/users/{user_id}")
+
+@app.get("/editorial-review/{submission_id}")
+async def editorial_review(
+    submission_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    check_auth(authorization)
+
+    submission = await call_ojs(f"/submissions/{submission_id}")
+    publications = await call_ojs(f"/submissions/{submission_id}/publications")
+    participants = await call_ojs(f"/submissions/{submission_id}/participants")
+    files = await call_ojs(f"/submissions/{submission_id}/files")
+
+    return {
+        "submissionId": submission_id,
+        "submission": submission,
+        "publications": publications,
+        "participants": participants,
+        "files": files,
+    }
