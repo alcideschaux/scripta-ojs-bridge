@@ -11,7 +11,7 @@ from pypdf import PdfReader
 
 app = FastAPI(
     title="Scripta Scientia OJS Bridge",
-    version="1.4.0",
+    version="1.4.1",
     description="Bridge seguro para conectar GPT Actions con OJS y extraer texto de manuscritos.",
 )
 
@@ -73,7 +73,8 @@ async def download_file(url: str) -> bytes:
             status_code=response.status_code,
             detail={
                 "download_status_code": response.status_code,
-                "download_response": response.text[:1000],
+                "download_response": response.text[:1500],
+                "download_url": url,
             },
         )
 
@@ -276,7 +277,7 @@ def health():
     return {
         "status": "ok",
         "service": "scripta-ojs-bridge",
-        "version": "1.4.0",
+        "version": "1.4.1",
         "ojs_base_url": OJS_BASE_URL,
     }
 
@@ -408,6 +409,7 @@ async def editorial_review_full(
         "characterCount": 0,
         "sectionsDetected": {},
         "warning": None,
+        "downloadError": None,
     }
 
     if not main_file:
@@ -422,7 +424,16 @@ async def editorial_review_full(
         extraction["warning"] = "El archivo principal no incluye URL de descarga."
         return {**base_review, "manuscriptExtraction": extraction}
 
-    content = await download_file(file_url)
+    try:
+        content = await download_file(file_url)
+    except HTTPException as exc:
+        extraction["warning"] = (
+            "No se pudo descargar el manuscrito desde OJS. "
+            "OJS devolvió un error de autorización para el archivo. "
+            "La revisión continúa con metadatos, participantes y lista de archivos."
+        )
+        extraction["downloadError"] = exc.detail
+        return {**base_review, "manuscriptExtraction": extraction}
 
     try:
         if ".docx" in file_name or "wordprocessingml" in mimetype:
@@ -451,6 +462,16 @@ async def editorial_review_full(
         extraction["warning"] = f"No se pudo extraer texto del manuscrito: {str(exc)}"
 
     return {**base_review, "manuscriptExtraction": extraction}
+
+
+@app.get("/debug/submission-file/{submission_id}/{file_id}")
+async def debug_submission_file(
+    submission_id: int,
+    file_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    check_auth(authorization)
+    return await call_ojs(f"/submissions/{submission_id}/files/{file_id}")
 
 
 @app.get("/users")
