@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: scripta-ojs-bridge
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OJS_BASE_URL
+        value: https://scriptascientia.com/sasc/api/v1
+      - key: OJS_API_TOKEN
+        sync: false
+      - key: BRIDGE_TOKEN
+        sync: false
