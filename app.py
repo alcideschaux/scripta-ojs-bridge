@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -7,8 +7,8 @@ from fastapi import FastAPI, Header, HTTPException, Query
 
 app = FastAPI(
     title="Scripta Scientia OJS Bridge",
-    version="1.0.0",
-    description="Bridge seguro para conectar GPT Actions con la API REST de OJS usando apiToken en query.",
+    version="1.1.0",
+    description="Bridge seguro para conectar GPT Actions con la API REST de OJS.",
 )
 
 OJS_BASE_URL = os.getenv("OJS_BASE_URL", "https://scriptascientia.com/sasc/api/v1").rstrip("/")
@@ -17,9 +17,6 @@ BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN")
 
 
 def check_auth(authorization: Optional[str]) -> None:
-    """
-    Valida el Bearer token recibido desde GPT Actions.
-    """
     if not BRIDGE_TOKEN:
         raise HTTPException(status_code=500, detail="BRIDGE_TOKEN not configured")
 
@@ -33,9 +30,6 @@ def check_auth(authorization: Optional[str]) -> None:
 
 
 async def call_ojs(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    """
-    Reenvía la solicitud a OJS agregando apiToken como parámetro de query.
-    """
     if not OJS_API_TOKEN:
         raise HTTPException(status_code=500, detail="OJS_API_TOKEN not configured")
 
@@ -62,11 +56,42 @@ async def call_ojs(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         return {"raw": response.text}
 
 
+def localized_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return value.get("es") or value.get("en") or next(iter(value.values()), None)
+    return value
+
+
+def summarize_submission(item: Dict[str, Any]) -> Dict[str, Any]:
+    publications = item.get("publications") or []
+    publication = publications[0] if publications else {}
+
+    title = (
+        publication.get("title")
+        or item.get("title")
+        or item.get("fullTitle")
+        or {}
+    )
+
+    return {
+        "id": item.get("id"),
+        "status": item.get("status"),
+        "statusLabel": item.get("statusLabel"),
+        "dateSubmitted": item.get("dateSubmitted"),
+        "lastModified": item.get("lastModified"),
+        "title": localized_value(title),
+        "currentPublicationId": item.get("currentPublicationId"),
+        "stageId": item.get("stageId"),
+        "url": item.get("_href"),
+    }
+
+
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "service": "scripta-ojs-bridge",
+        "version": "1.1.0",
         "ojs_base_url": OJS_BASE_URL,
     }
 
@@ -93,7 +118,7 @@ async def get_issue(
 @app.get("/submissions")
 async def list_submissions(
     authorization: Optional[str] = Header(default=None),
-    count: int = Query(default=20, ge=1, le=100),
+    count: int = Query(default=5, ge=1, le=20),
     offset: int = Query(default=0, ge=0),
     searchPhrase: Optional[str] = Query(default=None),
     status: Optional[int] = Query(default=None),
@@ -108,7 +133,16 @@ async def list_submissions(
     if status is not None:
         params["status"] = status
 
-    return await call_ojs("/submissions", params)
+    data = await call_ojs("/submissions", params)
+
+    items = data.get("items", []) if isinstance(data, dict) else []
+
+    return {
+        "items": [summarize_submission(item) for item in items],
+        "itemsMax": data.get("itemsMax") if isinstance(data, dict) else None,
+        "count": count,
+        "offset": offset,
+    }
 
 
 @app.get("/submissions/{submission_id}")
