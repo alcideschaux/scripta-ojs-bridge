@@ -1,14 +1,18 @@
+import io
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
+from docx import Document
 from fastapi import FastAPI, Header, HTTPException, Query
+from pypdf import PdfReader
 
 
 app = FastAPI(
     title="Scripta Scientia OJS Bridge",
-    version="1.3.0",
-    description="Bridge seguro para conectar GPT Actions con la API REST de OJS.",
+    version="1.4.0",
+    description="Bridge seguro para conectar GPT Actions con OJS y extraer texto de manuscritos.",
 )
 
 OJS_BASE_URL = os.getenv("OJS_BASE_URL", "https://scriptascientia.com/sasc/api/v1").rstrip("/")
@@ -55,6 +59,27 @@ async def call_ojs(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         return {"raw": response.text}
 
 
+async def download_file(url: str) -> bytes:
+    if not OJS_API_TOKEN:
+        raise HTTPException(status_code=500, detail="OJS_API_TOKEN not configured")
+
+    params = {"apiToken": OJS_API_TOKEN}
+
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        response = await client.get(url, params=params)
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail={
+                "download_status_code": response.status_code,
+                "download_response": response.text[:1000],
+            },
+        )
+
+    return response.content
+
+
 def localized_value(value: Any) -> Any:
     if isinstance(value, dict):
         return value.get("es") or value.get("en") or next(iter(value.values()), None)
@@ -69,10 +94,65 @@ def get_items(data: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def clean_text(text: str) -> str:
+    text = re.sub(r"\r\n|\r", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def extract_docx_text(content: bytes) -> str:
+    document = Document(io.BytesIO(content))
+    paragraphs = [p.text.strip() for p in document.paragraphs if p.text.strip()]
+
+    table_texts = []
+    for table in document.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if cells:
+                table_texts.append(" | ".join(cells))
+
+    return clean_text("\n".join(paragraphs + table_texts))
+
+
+def extract_pdf_text(content: bytes) -> str:
+    reader = PdfReader(io.BytesIO(content))
+    pages = []
+    for page in reader.pages:
+        page_text = page.extract_text() or ""
+        if page_text.strip():
+            pages.append(page_text.strip())
+    return clean_text("\n\n".join(pages))
+
+
+def word_count(text: str) -> int:
+    return len(re.findall(r"\b\w+\b", text, flags=re.UNICODE))
+
+
+def detect_sections(text: str) -> Dict[str, bool]:
+    lower = text.lower()
+
+    patterns = {
+        "title": r"\bt[ií]tulo\b",
+        "abstract": r"\b(resumen|abstract)\b",
+        "keywords": r"\b(palabras clave|keywords|descriptores)\b",
+        "introduction": r"\b(introducci[oó]n|antecedentes)\b",
+        "methods": r"\b(m[eé]todos|metodolog[ií]a|materiales y m[eé]todos)\b",
+        "results": r"\b(resultados)\b",
+        "discussion": r"\b(discusi[oó]n)\b",
+        "conclusion": r"\b(conclusiones?|consideraciones finales)\b",
+        "ethics": r"\b(comit[eé] de [eé]tica|aprobaci[oó]n [eé]tica|consentimiento informado)\b",
+        "conflicts": r"\b(conflictos? de inter[eé]s|conflict of interest)\b",
+        "funding": r"\b(financiamiento|fuente de financiamiento|funding)\b",
+        "references": r"\b(referencias|bibliograf[ií]a|references)\b",
+    }
+
+    return {key: bool(re.search(pattern, lower)) for key, pattern in patterns.items()}
+
+
 def summarize_submission(item: Dict[str, Any]) -> Dict[str, Any]:
     publications = item.get("publications") or []
     publication = publications[0] if publications else {}
-
     title = publication.get("title") or item.get("title") or item.get("fullTitle") or {}
 
     return {
@@ -130,6 +210,39 @@ def summarize_file(file_item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def choose_main_manuscript(files: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not files:
+        return None
+
+    def score(file_item: Dict[str, Any]) -> int:
+        name = str(file_item.get("name") or "").lower()
+        mimetype = str(file_item.get("mimetype") or "").lower()
+        file_stage = file_item.get("fileStage")
+
+        value = 0
+
+        if ".docx" in name or "wordprocessingml" in mimetype:
+            value += 50
+        if ".doc" in name:
+            value += 35
+        if ".pdf" in name or "pdf" in mimetype:
+            value += 25
+
+        if any(term in name for term in ["manuscrito", "manuscript", "articulo", "artículo"]):
+            value += 40
+
+        if any(term in name for term in ["primera hoja", "hoja frontal", "cover", "title page"]):
+            value -= 60
+
+        if file_stage in [2, 4]:
+            value += 10
+
+        return value
+
+    ranked = sorted(files, key=score, reverse=True)
+    return ranked[0] if score(ranked[0]) > 0 else None
+
+
 def detect_editorial_signals(
     submission_summary: Dict[str, Any],
     publications: List[Dict[str, Any]],
@@ -138,37 +251,23 @@ def detect_editorial_signals(
 ) -> Dict[str, Any]:
     file_names = " | ".join(str(f.get("name") or "").lower() for f in files)
 
-    has_main_manuscript = any(
-        term in file_names
-        for term in ["articulo", "artículo", "manuscrito", "manuscript", ".docx", ".doc", ".pdf"]
-    )
-
-    has_front_page = any(
-        term in file_names
-        for term in ["primera hoja", "hoja frontal", "front", "cover", "title page"]
-    )
-
-    has_abstract = any(bool(p.get("abstract")) for p in publications)
-    has_keywords = any(bool(p.get("keywords")) for p in publications)
-    has_doi = any(bool(p.get("doiObject")) for p in publications)
-
     return {
-        "hasMainManuscript": has_main_manuscript,
-        "hasFrontPageOrCoverFile": has_front_page,
-        "hasAbstractInMetadata": has_abstract,
-        "hasKeywordsInMetadata": has_keywords,
-        "hasDoiInMetadata": has_doi,
+        "hasMainManuscript": any(
+            term in file_names
+            for term in ["articulo", "artículo", "manuscrito", "manuscript", ".docx", ".doc", ".pdf"]
+        ),
+        "hasFrontPageOrCoverFile": any(
+            term in file_names
+            for term in ["primera hoja", "hoja frontal", "front", "cover", "title page"]
+        ),
+        "hasAbstractInMetadata": any(bool(p.get("abstract")) for p in publications),
+        "hasKeywordsInMetadata": any(bool(p.get("keywords")) for p in publications),
+        "hasDoiInMetadata": any(bool(p.get("doiObject")) for p in publications),
         "fileCount": len(files),
         "participantCount": len(participants),
         "publicationVersionCount": len(publications),
         "currentStageId": submission_summary.get("stageId"),
         "currentStatus": submission_summary.get("status"),
-        "requiresHumanManuscriptReview": True,
-        "notes": [
-            "La revisión consolidada resume metadatos OJS, participantes, publicaciones y archivos.",
-            "El contenido completo del manuscrito no se extrae todavía desde los archivos cargados.",
-            "Las decisiones editoriales deben confirmarse revisando el documento principal.",
-        ],
     }
 
 
@@ -177,7 +276,7 @@ def health():
     return {
         "status": "ok",
         "service": "scripta-ojs-bridge",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "ojs_base_url": OJS_BASE_URL,
     }
 
@@ -193,10 +292,7 @@ async def list_issues(
 
 
 @app.get("/issues/{issue_id}")
-async def get_issue(
-    issue_id: int,
-    authorization: Optional[str] = Header(default=None),
-):
+async def get_issue(issue_id: int, authorization: Optional[str] = Header(default=None)):
     check_auth(authorization)
     return await call_ojs(f"/issues/{issue_id}")
 
@@ -212,7 +308,6 @@ async def list_submissions(
     check_auth(authorization)
 
     params: Dict[str, Any] = {"count": count, "offset": offset}
-
     if searchPhrase:
         params["searchPhrase"] = searchPhrase
     if status is not None:
@@ -230,10 +325,7 @@ async def list_submissions(
 
 
 @app.get("/submissions/{submission_id}")
-async def get_submission(
-    submission_id: int,
-    authorization: Optional[str] = Header(default=None),
-):
+async def get_submission(submission_id: int, authorization: Optional[str] = Header(default=None)):
     check_auth(authorization)
     return await call_ojs(f"/submissions/{submission_id}")
 
@@ -272,10 +364,7 @@ async def list_submission_files(
 
 
 @app.get("/editorial-review/{submission_id}")
-async def editorial_review(
-    submission_id: int,
-    authorization: Optional[str] = Header(default=None),
-):
+async def editorial_review(submission_id: int, authorization: Optional[str] = Header(default=None)):
     check_auth(authorization)
 
     submission = await call_ojs(f"/submissions/{submission_id}")
@@ -288,30 +377,80 @@ async def editorial_review(
     participants = [summarize_participant(p) for p in get_items(participants_raw)]
     files = [summarize_file(f) for f in get_items(files_raw)]
 
-    signals = detect_editorial_signals(
-        submission_summary=submission_summary,
-        publications=publications,
-        participants=participants,
-        files=files,
-    )
-
     return {
         "submissionId": submission_id,
         "submission": submission_summary,
         "publications": publications,
         "participants": participants,
         "files": files,
-        "editorialSignals": signals,
-        "recommendedUse": {
-            "instruction": "Use this object to produce an editorial triage. Do not invent manuscript content not present in the metadata or files list.",
-            "minimumNextSteps": [
-                "Verify author metadata and uploaded files.",
-                "Check whether the main manuscript and front page are present.",
-                "Identify missing metadata such as abstract, keywords, ORCID, ethics approval, conflicts of interest, and funding.",
-                "Recommend whether to request corrections before peer review or proceed to editor assignment.",
-            ],
-        },
+        "editorialSignals": detect_editorial_signals(submission_summary, publications, participants, files),
     }
+
+
+@app.get("/editorial-review-full/{submission_id}")
+async def editorial_review_full(
+    submission_id: int,
+    authorization: Optional[str] = Header(default=None),
+    maxCharacters: int = Query(default=30000, ge=1000, le=60000),
+):
+    check_auth(authorization)
+
+    base_review = await editorial_review(submission_id, authorization)
+
+    files = base_review.get("files", [])
+    main_file = choose_main_manuscript(files)
+
+    extraction = {
+        "success": False,
+        "file": main_file,
+        "text": None,
+        "wordCount": 0,
+        "characterCount": 0,
+        "sectionsDetected": {},
+        "warning": None,
+    }
+
+    if not main_file:
+        extraction["warning"] = "No se pudo identificar un manuscrito principal descargable."
+        return {**base_review, "manuscriptExtraction": extraction}
+
+    file_url = main_file.get("url")
+    file_name = str(main_file.get("name") or "").lower()
+    mimetype = str(main_file.get("mimetype") or "").lower()
+
+    if not file_url:
+        extraction["warning"] = "El archivo principal no incluye URL de descarga."
+        return {**base_review, "manuscriptExtraction": extraction}
+
+    content = await download_file(file_url)
+
+    try:
+        if ".docx" in file_name or "wordprocessingml" in mimetype:
+            text = extract_docx_text(content)
+        elif ".pdf" in file_name or "pdf" in mimetype:
+            text = extract_pdf_text(content)
+        else:
+            extraction["warning"] = f"Tipo de archivo no soportado para extracción: {mimetype or file_name}"
+            return {**base_review, "manuscriptExtraction": extraction}
+
+        if len(text) > maxCharacters:
+            text = text[:maxCharacters] + "\n\n[Texto truncado por límite de caracteres.]"
+
+        extraction.update(
+            {
+                "success": True,
+                "text": text,
+                "wordCount": word_count(text),
+                "characterCount": len(text),
+                "sectionsDetected": detect_sections(text),
+                "warning": None,
+            }
+        )
+
+    except Exception as exc:
+        extraction["warning"] = f"No se pudo extraer texto del manuscrito: {str(exc)}"
+
+    return {**base_review, "manuscriptExtraction": extraction}
 
 
 @app.get("/users")
@@ -331,9 +470,6 @@ async def list_users(
 
 
 @app.get("/users/{user_id}")
-async def get_user(
-    user_id: int,
-    authorization: Optional[str] = Header(default=None),
-):
+async def get_user(user_id: int, authorization: Optional[str] = Header(default=None)):
     check_auth(authorization)
     return await call_ojs(f"/users/{user_id}")
